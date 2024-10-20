@@ -5,6 +5,8 @@ from pdb import set_trace
 import matplotlib
 matplotlib.use('Qt5Agg')
 
+from scipy.io import wavfile
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import pyqtRemoveInputHook
 
@@ -14,6 +16,7 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
 from jet import colorMap
+from dataparser import getAsciiData
 
 class MplCanvas(FigureCanvasQTAgg):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
@@ -31,6 +34,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.FS = 100e3
         self.peak_freq = 0
         self.numpeaks = 3
+        self.fft_len = 1
+        self.num_ffts = 1
         self.peaks = []
         toolbar = NavigationToolbar(self.sc, self)
 
@@ -99,46 +104,31 @@ class MainWindow(QtWidgets.QMainWindow):
         with open('pyqtplot.ini', 'w') as f:
             json.dump(inidata, f)
 
-        # get the data from the file
-        f = open(self.filename, 'r')
-        data = f.read()
-        possible_delimiters = [',', ' ', '\n'] #whichever of these occurs the most in the data, I will assume is the delimiter
-        delimiter_max = 0
-        delimiter_curr = ''
-
-        for delimiter in possible_delimiters:
-            if (data.count(delimiter) > delimiter_max):
-                delimiter_max = data.count(delimiter)
-                delimiter_curr = delimiter
-        
-        data_raw = data
-        data = data.split(delimiter_curr)
-
-        if ('a' in data_raw.lower()) or \
-            ('b' in data_raw.lower()) or \
-            ('c' in data_raw.lower()) or \
-            ('d' in data_raw.lower()) or \
-            ('e' in data_raw.lower()) or \
-            ('f' in data_raw.lower()):
-            data = getHexData(data)
-            print('Detected int, base16 data')
-        elif '.' in data_raw: #probably dealing with floating point data
-            data = [float(point) for point in data if point]
-            print('Detected float data')
-        else: #assuming int data, base10
-            data = [int(point) for point in data if point]
-            print('Detected int, base10 data')
-
-        data = np.array(data)
-        self.data = data
-        
+        if (self.filename.lower().endswith('.wav')):
+            self.FS, data = wavfile.read(self.filename)
+            try:
+                if (data.shape[1] > 0):
+                    self.data = data[:, 0] #only want one channel, '0'=left, '1'=right if it exists...
+            except IndexError: #only one channel of data available
+                self.data = data
+            self.lineedit_FS.setText(str(self.FS))
+        else: #assuming data is ascii and delimited
+            # get the data from the file
+            f = open(self.filename, 'r')
+            data = f.read()
+            try:
+                data = np.array(getAsciiData(data))
+                self.FS = float(self.lineedit_FS.text())       
+                self.data = data
+            except Exception as e:
+                print(f'Unable to parse data from file: {self.filename}. Exception: {e}')
+                return
 
         self.lineedit_filename.setText(self.filename)
-        self.sc.fig.suptitle(self.filename)
-        self.FS = float(self.lineedit_FS.text())
+        self.sc.fig.suptitle(self.filename)        
 
-        self.fft_len = 512
-        tstop = len(data) * (1/self.FS)
+        self.fft_len = min(512, len(self.data))
+        tstop = len(self.data) * (1/self.FS)
         self.t = np.arange(0,tstop,1/self.FS)    
         
         self.updateFFT()
@@ -147,7 +137,7 @@ class MainWindow(QtWidgets.QMainWindow):
     
 
     def updateFFT(self):
-        self.num_ffts = len(self.t) // self.fft_len
+        self.num_ffts = max(1, len(self.t) // self.fft_len)
         self.Y = np.empty( shape=(self.num_ffts, self.fft_len) )
         self.img = np.ones( shape=(self.num_ffts, self.fft_len//2, 3), dtype=np.uint8 ) * 255
         self.FS = float(self.lineedit_FS.text())
@@ -174,11 +164,17 @@ class MainWindow(QtWidgets.QMainWindow):
         #self.hscroll.setPageStep(2) #did not seem to work, steps were still 1
 
     def updateVRange(self):
-        self.vscroll.setRange(0, self.num_ffts-1)
-
+        try:
+            self.vscroll.setRange(0, self.num_ffts-1)
+        except AttributeError:
+            return
+        
     def updateHRange(self):
-        self.hscroll.setRange(min(32, len(self.data)//2), len(self.data)//2)
-
+        try:
+            self.hscroll.setRange(min(32, len(self.data)//2), len(self.data)//2)
+        except AttributeError:
+            return
+        
     def plotData(self):
         FS = self.FS
         t = np.arange(self.curr_fft * (self.fft_len/FS), ((1+self.curr_fft) * (self.fft_len/FS)), 1/FS)
@@ -202,34 +198,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sc.draw()
 
     def updatePlotH(self): #if fft length changes, we need to change num ffts available and h cursor
-        self.curr_fft = 0
-        self.fft_len = 2 * self.hscroll.value()
-        self.updateFFT()
-        self.updateVRange()
-        self.plotData()
+        try:
+            self.curr_fft = 0
+            self.fft_len = 2 * self.hscroll.value()
+            self.updateFFT()
+            self.updateVRange()
+            self.plotData()
+        except Exception:
+            return
 
     def updatePlotV(self):
-        self.curr_fft = self.vscroll.value()
-        self.xstart = (self.curr_fft) * self.fft_len
-        self.xstop = min((1+self.curr_fft) * self.fft_len, len(self.data)) 
-        self.plotData()
-
-def getHexData(data):
-    numbits = len(data[0]) * 4
-    signbitmask = (2**(numbits-1))
-    xormask = (2**numbits)-1
-    rtn = []
-    for point in data:
-        if (point): #use this to discard '' entries
-            point = int(point, 16)
-            if (point & signbitmask): #we have a negative number
-                # 2's complement, flip all bits, add one, multiply by -1
-                point ^= xormask
-                point += 1
-                point *= -1
-            rtn.append(point)
-    return rtn
-
+        try: #adding this so no crash w/no data and moving scroll bars
+            self.curr_fft = self.vscroll.value()
+            self.xstart = (self.curr_fft) * self.fft_len
+            self.xstop = min((1+self.curr_fft) * self.fft_len, len(self.data)) 
+            self.plotData()
+        except Exception:
+            return
+        
 def breakQtHere():
     pyqtRemoveInputHook()
     set_trace()
